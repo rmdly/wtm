@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+#
+# wtm — numbered git worktree slots.
+#
+#   wtm init [n]      make slots 1..n in this repo (default 3)
+#   wtm status        every slot, as a table
+#   wtm setup <n>     install dependencies in slot n
+#   wtm list          this repo's worktrees
+#   wtm clean         forget worktrees whose folders are gone
+#
+# Slots live in <repo>/.worktrees/<n>. A slot on its wt<n> branch is free.
+# Repos are found under ~/code, or the folders listed in ~/.config/wtm/roots.
+
+set -euo pipefail
+
+DEFAULT_COUNT=3
+
+die() { printf 'wtm: %s\n' "$1" >&2; exit 1; }
+info() { printf '  %s\n' "$1"; }
+
+# Resolve the main checkout. --git-common-dir points at the shared .git even when
+# invoked from inside a linked worktree, so slots never nest inside each other.
+require_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
+  COMMON_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+  MAIN_ROOT="$(dirname "$COMMON_DIR")"
+  WT_ROOT="$MAIN_ROOT/.worktrees"
+}
+
+# origin/HEAD is the authoritative default branch; fall back through the usual
+# names for repos that have never had it set.
+default_ref() {
+  local ref
+  for ref in refs/remotes/origin/HEAD refs/remotes/origin/master refs/remotes/origin/main; do
+    if git -C "$MAIN_ROOT" symbolic-ref --quiet "$ref" >/dev/null 2>&1; then
+      git -C "$MAIN_ROOT" symbolic-ref --short "$ref"; return
+    fi
+    if git -C "$MAIN_ROOT" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+      printf '%s' "${ref#refs/remotes/}"; return
+    fi
+  done
+  for ref in master main; do
+    if git -C "$MAIN_ROOT" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null 2>&1; then
+      printf '%s' "$ref"; return
+    fi
+  done
+  die "could not determine a default branch — pass one with: git worktree add"
+}
+
+# .worktrees goes in .git/info/exclude rather than .gitignore: it is a local
+# workflow choice, so it stays out of the repo's tracked ignore rules.
+ensure_excluded() {
+  local exclude="$COMMON_DIR/info/exclude"
+  mkdir -p "$(dirname "$exclude")"
+  if ! git -C "$MAIN_ROOT" check-ignore --quiet .worktrees 2>/dev/null; then
+    printf '\n# Local numbered worktrees (wtm)\n.worktrees/\n' >>"$exclude"
+    info "excluded .worktrees via .git/info/exclude"
+  fi
+}
+
+# Gitignored files a fresh checkout cannot get from git but needs to boot.
+seed_local_files() {
+  local dest="$1" slot="$2" src="$MAIN_ROOT" f
+  for f in .envrc .env .env.local .env.development.local config/master.key; do
+    if [ -f "$src/$f" ] && [ ! -e "$dest/$f" ]; then
+      mkdir -p "$(dirname "$dest/$f")"
+      cp "$src/$f" "$dest/$f"
+      info "copied $f"
+    fi
+  done
+
+  if [ -d "$src/config/credentials" ]; then
+    shopt -s nullglob
+    local keys=("$src"/config/credentials/*.key)
+    shopt -u nullglob
+    if [ ${#keys[@]} -gt 0 ]; then
+      mkdir -p "$dest/config/credentials"
+      cp "${keys[@]}" "$dest/config/credentials/"
+      info "copied ${#keys[@]} credential key(s)"
+    fi
+  fi
+
+  # Rails apps on the postgresql_branched adapter get a dev schema per git
+  # branch. Pinning PGBRANCH to the slot keeps one stable
+  # schema per slot instead of a new one for every branch switched into it.
+  if [ -f "$dest/.envrc" ] && grep -q 'postgresql_branched' "$src/config/database.yml" 2>/dev/null; then
+    if ! grep -q '^export PGBRANCH=' "$dest/.envrc"; then
+      printf '\n# Pinned by wtm: one stable dev schema for this worktree slot.\nexport PGBRANCH=wt%s\n' "$slot" >>"$dest/.envrc"
+      info "pinned PGBRANCH=wt$slot"
+    fi
+  fi
+
+  if [ -f "$dest/.envrc" ] && command -v direnv >/dev/null 2>&1; then
+    direnv allow "$dest" 2>/dev/null && info "direnv allow"
+  fi
+}
+
+cmd_init() {
+  local count="${1:-$DEFAULT_COUNT}"
+  case "$count" in ''|*[!0-9]*) die "count must be a number";; esac
+  [ "$count" -ge 1 ] || die "count must be at least 1"
+
+  require_repo
+  ensure_excluded
+  local base; base="$(default_ref)"
+  printf 'Repo: %s\nBase: %s\n\n' "$MAIN_ROOT" "$base"
+
+  mkdir -p "$WT_ROOT"
+  local n dir branch
+  for n in $(seq 1 "$count"); do
+    dir="$WT_ROOT/$n"
+    branch="wt$n"
+    printf 'Slot %s → %s\n' "$n" "$dir"
+
+    if [ -e "$dir/.git" ]; then
+      info "already exists, on $(git -C "$dir" branch --show-current 2>/dev/null || echo 'detached HEAD')"
+    else
+      [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ] && die "$dir exists and is not a worktree — move it aside first"
+      if git -C "$MAIN_ROOT" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1; then
+        git -C "$MAIN_ROOT" worktree add "$dir" "$branch" >/dev/null
+        info "checked out existing branch $branch"
+      else
+        # --no-track: branching off origin/<default> would otherwise set the
+        # default branch as upstream, so a stray push from a scratch slot would
+        # target master.
+        git -C "$MAIN_ROOT" worktree add --no-track -b "$branch" "$dir" "$base" >/dev/null
+        info "created branch $branch off $base"
+      fi
+    fi
+
+    seed_local_files "$dir" "$n"
+    printf '\n'
+  done
+
+  printf 'Done. Use a slot with:\n  cd %s/1\n  git switch <branch>   # or: git switch -c <new-branch>\n' "$WT_ROOT"
+  [ -f "$MAIN_ROOT/Gemfile" ] && printf '  wtm setup 1            # first time only: install deps\n'
+  return 0
+}
+
+cmd_list() {
+  require_repo
+  git -C "$MAIN_ROOT" worktree list
+}
+
+cmd_setup() {
+  local n="${1:-}"
+  [ -n "$n" ] || die "usage: wtm setup <n>"
+  require_repo
+  local dir="$WT_ROOT/$n"
+  [ -e "$dir/.git" ] || die "slot $n is not a worktree — run: wtm init"
+
+  printf 'Setting up %s\n\n' "$dir"
+  if [ -f "$dir/Gemfile" ]; then
+    info "bundle install"; (cd "$dir" && bundle install)
+  fi
+  if [ -f "$dir/yarn.lock" ]; then
+    info "yarn install"; (cd "$dir" && yarn install)
+  elif [ -f "$dir/package-lock.json" ]; then
+    info "npm install"; (cd "$dir" && npm install)
+  fi
+  if [ -f "$dir/config/database.yml" ]; then
+    info "database"
+
+    # Snapshot tracked modifications first, so migration side-effects can be
+    # reverted without disturbing work already in progress in this slot.
+    local before after f reverted=0
+    before="$(git -C "$dir" diff --name-only)"
+
+    # DUMP_SCHEMA_AFTER_MIGRATION=false: a slot's migration would otherwise
+    # re-dump schema.rb from its own (possibly partial) schema. db:branch:reset
+    # only exists on the postgresql_branched adapter; elsewhere it's a no-op.
+    (
+      cd "$dir"
+      export DUMP_SCHEMA_AFTER_MIGRATION=false
+      bundle exec rails db:branch:reset >/dev/null 2>&1 || true
+      bundle exec rails db:migrate
+    )
+
+    # Annotation gems rewrite model comments on db:migrate, so a fresh slot can
+    # end up dirty for no reason. Revert only what this run touched.
+    after="$(git -C "$dir" diff --name-only)"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '%s\n' "$before" | grep -qxF -- "$f" && continue
+      git -C "$dir" restore -- "$f" && reverted=$((reverted + 1))
+    done <<<"$after"
+    [ "$reverted" -gt 0 ] && info "reverted $reverted file(s) of migration noise (annotations / schema.rb)"
+  fi
+  printf '\nSlot %s ready.\n' "$n"
+}
+
+# Where to look for repos. git worktree list is per-repo, so a cross-repo view
+# has to discover the repos first.
+status_roots() {
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/wtm/roots"
+  if [ -f "$cfg" ]; then
+    grep -vE '^[[:space:]]*(#|$)' "$cfg"
+  else
+    printf '%s\n' "$HOME/code"
+  fi
+}
+
+# Main checkouts only: a linked worktree has .git as a file, not a directory.
+# Hidden dirs, node_modules and .worktrees are pruned so this stays fast over $HOME.
+discover_repos() {
+  local root
+  while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    find "$root" -maxdepth 4 \
+      -type d \( -name node_modules -o -name .worktrees -o \( -name '.?*' ! -name .git \) \) -prune -o \
+      -type d -name .git -print 2>/dev/null
+  done < <(status_roots) | sed 's:/\.git$::' | sort -u
+}
+
+# Branch name, or a short sha for a detached HEAD.
+wt_ref() {
+  git -C "$1" branch --show-current 2>/dev/null | grep . ||
+    printf 'detached %s' "$(git -C "$1" rev-parse --short HEAD 2>/dev/null || echo '?')"
+}
+
+# Dirty file count plus ahead/behind, as one human-readable phrase.
+wt_state() {
+  local dir="$1" dirty ahead behind parts=()
+  dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l)"
+  [ "$dirty" -gt 0 ] && parts+=("$dirty modified")
+  if git -C "$dir" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    read -r behind ahead < <(git -C "$dir" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null || echo '0 0')
+    [ "${ahead:-0}" -gt 0 ] && parts+=("$ahead ahead")
+    [ "${behind:-0}" -gt 0 ] && parts+=("$behind behind")
+  else
+    # Never pushed: count the commits no remote has, which is what's at risk.
+    ahead="$(git -C "$dir" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)"
+    [ "${ahead:-0}" -gt 0 ] && parts+=("$ahead unpushed")
+  fi
+  [ ${#parts[@]} -eq 0 ] && { printf 'clean'; return; }
+  local IFS=', '; printf '%s' "${parts[*]}"
+}
+
+# The slot number for a .worktrees/<n> checkout, else a readable fallback.
+slot_label() {
+  local dir="$1" repo="$2"
+  [ "$dir" = "$repo" ] && { printf 'main'; return; }
+  case "$dir" in
+    "$repo"/.worktrees/*) printf '%s' "${dir#"$repo"/.worktrees/}" ;;
+    *) printf '%s' "$(basename "$dir")" ;;
+  esac
+}
+
+cmd_status() {
+  local show_all=0
+  case "${1:-}" in
+    --all) show_all=1 ;;
+    '') ;;
+    *) die "usage: wtm status [--all]" ;;
+  esac
+
+  local repo repos=() paths=() dir shown=0
+  mapfile -t repos < <(discover_repos)
+  [ ${#repos[@]} -gt 0 ] || die "no repositories found under: $(status_roots | tr '\n' ' ')"
+
+  for repo in "${repos[@]}"; do
+    mapfile -t paths < <(git -C "$repo" worktree list --porcelain 2>/dev/null |
+      awk '/^worktree /{ print substr($0, 10) }')
+    [ ${#paths[@]} -gt 0 ] || continue
+
+    # A lone entry means the main checkout only — no slots set up here.
+    if [ ${#paths[@]} -le 1 ]; then
+      [ "$show_all" -eq 1 ] && printf '%-22s %-4s %s\n' "$(basename "$repo")" "-" "no slots"
+      continue
+    fi
+
+    [ "$shown" -eq 1 ] && printf '\n'
+    shown=1
+    local label
+    label="$(basename "$repo")"
+    for dir in "${paths[@]}"; do
+      if [ ! -d "$dir" ]; then
+        printf '%-22s %-4s %-34s %s\n' "$label" "$(slot_label "$dir" "$repo")" "?" "MISSING — run: wtm clean"
+      else
+        printf '%-22s %-4s %-34s %s\n' "$label" "$(slot_label "$dir" "$repo")" "$(wt_ref "$dir")" "$(wt_state "$dir")"
+      fi
+      label=""
+    done
+  done
+
+  [ "$shown" -eq 0 ] && [ "$show_all" -eq 0 ] &&
+    printf 'No repos have worktree slots yet. Run "wtm init" in one, or "wtm status --all".\n'
+  return 0
+}
+
+cmd_clean() {
+  require_repo
+  git -C "$MAIN_ROOT" worktree prune -v
+  printf 'Pruned. Remaining:\n'
+  git -C "$MAIN_ROOT" worktree list
+}
+
+case "${1:-}" in
+  init)   shift; cmd_init "$@" ;;
+  list)   shift; cmd_list "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  setup) shift; cmd_setup "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  ''|-h|--help|help)
+    awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
+    ;;
+  *) die "unknown command '$1' — try: wtm --help" ;;
+esac
