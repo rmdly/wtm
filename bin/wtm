@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# wtm — numbered git worktree slots.
+# wtm — numbered git worktree slots, one menu.
 #
+#   wtm               the menu (needs fzf)
 #   wtm init [n]      make slots 1..n in this repo (default 3)
 #   wtm status        every slot, as a table
 #   wtm setup <n>     install dependencies in slot n
@@ -295,13 +296,309 @@ cmd_clean() {
   git -C "$MAIN_ROOT" worktree list
 }
 
+# --- The menu ------------------------------------------------------------------
+#
+# `wtm` on its own lists every worktree of every repo that has slots, in fzf.
+# Each line carries two hidden fields, the path and its kind (main, slot or
+# extra), which the key bindings hand to the `wtm _<action>` helpers below.
+
+SELF="$(readlink -f "$0")"
+BOLD=$'\e[1m' DIM=$'\e[2m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
+
+# Process names that don't count as "something is running here": a shell
+# sitting in a slot is not work in progress.
+IDLE_PROGRAMS='^(bash|zsh|fish|sh|dash|tmux.*|fzf|git|wt|wtm|sleep|cut|sed|awk|grep|sort|head|tail|cat|less|find|readlink)$'
+
+pause() {
+  [ -t 1 ] || return 0
+  printf '\n%sPress any key to go back…%s ' "$DIM" "$RESET"
+  { read -rsn1 </dev/tty; } 2>/dev/null || true
+}
+
+# "<worktree root><TAB><program, program>" for every worktree something runs in.
+running_programs() {
+  [ -d /proc ] || return 0
+  local -A top=() names=()
+  local p cwd comm root roots
+  roots="$(status_roots)"
+  # One find over /proc reads every process's working folder; awk keeps the
+  # ones under the search roots. Far cheaper than a readlink per process.
+  while IFS=$'\t' read -r p cwd; do
+    { read -r comm <"$p/comm"; } 2>/dev/null || continue
+    [[ "$comm" =~ $IDLE_PROGRAMS ]] && continue
+    [ -n "${top[$cwd]+x}" ] || top[$cwd]="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)"
+    root="${top[$cwd]}"
+    [ -n "$root" ] || continue
+    case ", ${names[$root]:-}, " in
+      *", $comm, "*) ;;
+      *) names[$root]="${names[$root]:+${names[$root]}, }$comm" ;;
+    esac
+  done < <(
+    find /proc -mindepth 2 -maxdepth 2 -name cwd -printf '%h\t%l\n' 2>/dev/null |
+      awk -F'\t' -v roots="$roots" '
+        BEGIN { n = split(roots, r, "\n") }
+        { for (i = 1; i <= n; i++) if ($2 == r[i] || index($2, r[i] "/") == 1) { print; next } }'
+  )
+  for root in "${!names[@]}"; do printf '%s\t%s\n' "$root" "${names[$root]}"; done
+}
+
+# Main checkout first, then slots in number order, then anything else.
+worktree_paths() {
+  git -C "$1" worktree list --porcelain 2>/dev/null |
+    awk '/^worktree /{ print substr($0, 10) }' |
+    awk -v main="$1" '$0 == main { print "0\t" $0; next } { print "1\t" $0 }' |
+    sort -t$'\t' -k1,1 -k2,2V | cut -f2-
+}
+
+kind_of() {
+  case "$2" in
+    "$1") printf 'main' ;;
+    "$1"/.worktrees/[0-9]*) printf 'slot' ;;
+    *) printf 'extra' ;;
+  esac
+}
+
+repo_of() { dirname "$(cd "$(git -C "$1" rev-parse --git-common-dir)" && pwd)"; }
+
+cmd_rows() {
+  local -A busy=()
+  local root names repo dir kind slot ref state run line repos=() paths=()
+  while IFS=$'\t' read -r root names; do busy[$root]="$names"; done < <(running_programs)
+  mapfile -t repos < <(discover_repos)
+
+  for repo in "${repos[@]}"; do
+    mapfile -t paths < <(worktree_paths "$repo")
+    [ ${#paths[@]} -gt 1 ] || continue
+    for dir in "${paths[@]}"; do
+      [ -d "$dir" ] || continue
+      kind="$(kind_of "$repo" "$dir")"
+      slot="$(slot_label "$dir" "$repo")"
+      ref="$(wt_ref "$dir")"
+      state="$(wt_state "$dir")"
+      run="${busy[$dir]:-}"
+
+      line="$(printf '%-20s %-10s ' "$(basename "$repo")" "${slot:0:10}")"
+      if [ "$kind" = slot ] && [ "$ref" = "wt$slot" ]; then
+        line+="$DIM$(printf '%-44s %-20s' 'free' '')$RESET"
+      else
+        line+="$(printf '%-44s ' "${ref:0:44}")"
+        if [ "$state" = clean ]; then line+="$(printf '%-20s' clean)"
+        else line+="$YELLOW$(printf '%-20s' "$state")$RESET"; fi
+      fi
+      [ "$kind" = extra ] && line+=" ${DIM}extra${RESET}"
+      [ -n "$run" ] && line+=" $GREEN▶ ${run:0:30}$RESET"
+      printf '%s\t%s\t%s\n' "$dir" "$kind" "$line"
+    done
+  done
+}
+
+cmd_preview() {
+  local dir="$1" kind="$2" repo slot ref changes unpushed
+  [ -d "$dir" ] || { echo "This worktree is gone. Press ctrl-r to refresh."; return; }
+  repo="$(repo_of "$dir")"
+  slot="$(slot_label "$dir" "$repo")"
+  ref="$(wt_ref "$dir")"
+
+  case "$kind" in
+    main)  printf '%s%s · main checkout%s\n' "$BOLD" "$(basename "$repo")" "$RESET"
+           echo "The repo itself. Slots share its commits, branches and fetches." ;;
+    slot)  printf '%s%s · slot %s%s\n' "$BOLD" "$(basename "$repo")" "$slot" "$RESET"
+           if [ "$ref" = "wt$slot" ]; then
+             echo "Free. Press ctrl-b to put a branch in it."
+           else
+             echo "Holding $ref. Press ctrl-f when you're done to free it."
+           fi ;;
+    extra) printf '%s%s · %s (extra)%s\n' "$BOLD" "$(basename "$repo")" "$slot" "$RESET"
+           echo "A one-off worktree, not a slot. Press ctrl-x to remove it once you're done." ;;
+  esac
+  printf '%s%s%s\n\n' "$DIM" "$dir" "$RESET"
+
+  git -C "$dir" -c color.status=always status -sb 2>/dev/null | head -1
+  changes="$(git -C "$dir" -c color.status=always status -s 2>/dev/null | head -15)"
+  if [ -n "$changes" ]; then printf '\n%sUncommitted changes%s\n%s\n' "$BOLD" "$RESET" "$changes"
+  else printf '%sNo uncommitted changes.%s\n' "$DIM" "$RESET"; fi
+
+  if git -C "$dir" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    unpushed="$(git -C "$dir" log --oneline --color=always '@{u}..HEAD' 2>/dev/null | head -10)"
+  else
+    unpushed="$(git -C "$dir" log --oneline --color=always HEAD --not --remotes 2>/dev/null | head -10)"
+  fi
+  [ -n "$unpushed" ] && printf '\n%sNot pushed yet%s\n%s\n' "$BOLD" "$RESET" "$unpushed"
+
+  printf '\n%sRecent commits%s\n' "$BOLD" "$RESET"
+  git -C "$dir" log --oneline --color=always -5 2>/dev/null
+
+  local root names
+  while IFS=$'\t' read -r root names; do
+    [ "$root" = "$dir" ] && printf '\n%sRunning here:%s %s%s%s\n' "$BOLD" "$RESET" "$GREEN" "$names" "$RESET"
+  done < <(running_programs)
+  return 0
+}
+
+# Enter: jump to this worktree's tmux window, opening one if needed. Windows are
+# named after the repo's last word and the slot, e.g. rails/3.
+cmd_open() {
+  local dir="$1" repo slot name id
+  repo="$(repo_of "$dir")"
+  slot="$(slot_label "$dir" "$repo")"
+  name="$(basename "$repo")"; name="${name##*-}/$slot"
+  if [ -z "${TMUX:-}" ]; then
+    printf 'Not inside tmux. Go there with:\n  cd %q\n' "$dir"
+    return 0
+  fi
+  id="$(tmux list-windows -F '#{window_id} #{window_name}' | awk -v n="$name" '{ id = $1; $1 = ""; sub(/^ /, "") } $0 == n { print id; exit }')"
+  if [ -n "$id" ]; then tmux select-window -t "$id"
+  else tmux new-window -n "$name" -c "$dir"; fi
+}
+
+dirty_count() { git -C "$1" status --porcelain 2>/dev/null | wc -l; }
+
+# ctrl-b: pick a branch for this worktree, or type a new name to start one.
+cmd_branch() {
+  local dir="$1" kind="$2" repo base dirty out query pick
+  [ "$kind" != extra ] || { echo "Extras aren't reused. Free a slot for new work instead."; pause; return 0; }
+  dirty="$(dirty_count "$dir")"
+  if [ "$dirty" -gt 0 ]; then
+    echo "This worktree has $dirty uncommitted change(s). Commit or stash them first:"
+    git -C "$dir" status -s | head -15
+    pause; return 0
+  fi
+  repo="$(repo_of "$dir")"
+  MAIN_ROOT="$repo"; base="$(default_ref)"
+
+  printf 'Fetching %s…\n' "$(basename "$repo")"
+  git -C "$repo" fetch --prune --quiet origin 2>/dev/null || echo "(fetch failed — showing what's known locally)"
+
+  # Newest first, local and remote merged into one name each. Branches already
+  # checked out in another worktree can't be used here (git refuses), so
+  # they're left out.
+  local in_use
+  in_use="$(git -C "$repo" worktree list --porcelain | awk '/^branch /{ sub("refs/heads/", "", $2); print $2 }')"
+  out="$(
+    git -C "$repo" for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads refs/remotes/origin |
+    sed 's#^origin/##' | grep -vxE 'HEAD|origin|wt[0-9]+' |
+    awk -v used="$in_use" 'BEGIN { n = split(used, u, "\n"); for (i = 1; i <= n; i++) skip[u[i]] = 1 } !seen[$0]++ && !skip[$0]' |
+    fzf --print-query --height=60% --reverse --prompt='branch> ' \
+        --header="pick a branch, or type a new one (from $base)" \
+        --preview="git -C $(printf '%q' "$repo") log --oneline --color=always -10 {} 2>/dev/null || git -C $(printf '%q' "$repo") log --oneline --color=always -10 origin/{}"
+  )" || true
+
+  query="$(sed -n 1p <<<"$out")"
+  pick="$(sed -n 2p <<<"$out")"
+  if [ -n "$pick" ]; then
+    git -C "$dir" switch "$pick" || { pause; return 0; }
+  elif [ -n "$query" ]; then
+    git -C "$dir" switch --no-track -c "$query" "$base" || { pause; return 0; }
+  else
+    return 0
+  fi
+  # A local branch can be far behind its remote (an old master, an MR someone
+  # else pushed to). The slot is clean, so catching up is safe whenever there
+  # are no local-only commits to merge.
+  local behind ahead
+  if git -C "$dir" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    read -r behind ahead < <(git -C "$dir" rev-list --left-right --count '@{u}...HEAD')
+    if [ "$behind" -gt 0 ] && [ "$ahead" -eq 0 ]; then
+      git -C "$dir" merge --ff-only --quiet '@{u}' && echo "Caught up with $(git -C "$dir" rev-parse --abbrev-ref '@{u}') ($behind new commits)."
+    elif [ "$behind" -gt 0 ]; then
+      echo "Heads up: $behind commits behind its remote and $ahead of your own not pushed. Pull when ready."
+    fi
+  fi
+  printf '\n%sNow on %s.%s\n' "$GREEN" "$(wt_ref "$dir")" "$RESET"
+  [ "$kind" = slot ] && [ -f "$dir/Gemfile" ] && echo "If it needs gems or migrations: alt-s runs setup."
+  pause
+}
+
+# ctrl-f: put the slot back on its own wt<n> branch, fresh from the default
+# branch. The branch it held is left alone, so nothing is lost.
+cmd_free() {
+  local dir="$1" kind="$2" repo slot ref dirty base extra
+  [ "$kind" = slot ] || { echo "Only numbered slots can be freed."; pause; return 0; }
+  repo="$(repo_of "$dir")"
+  slot="$(slot_label "$dir" "$repo")"
+  ref="$(wt_ref "$dir")"
+  [ "$ref" != "wt$slot" ] || { echo "Slot $slot is already free."; pause; return 0; }
+  dirty="$(dirty_count "$dir")"
+  if [ "$dirty" -gt 0 ]; then
+    echo "Slot $slot has $dirty uncommitted change(s). Commit or stash them first:"
+    git -C "$dir" status -s | head -15
+    pause; return 0
+  fi
+  # wt<n> is meant to be empty. If someone committed on it, resetting it would
+  # hide that work, so stop and say so.
+  if git -C "$repo" rev-parse --verify --quiet "refs/heads/wt$slot" >/dev/null; then
+    extra="$(git -C "$repo" rev-list --count "wt$slot" --not --remotes)"
+    if [ "$extra" -gt 0 ]; then
+      echo "wt$slot has $extra commit(s) of its own. Move them to a real branch first:"
+      echo "  git -C $dir switch wt$slot && git -C $dir switch -c <name>"
+      pause; return 0
+    fi
+  fi
+  MAIN_ROOT="$repo"; base="$(default_ref)"
+  git -C "$dir" switch --quiet --no-track -C "wt$slot" "$base" || { pause; return 0; }
+  printf '%sSlot %s is free.%s Branch %s is kept — ctrl-b brings it back.\n' "$GREEN" "$slot" "$RESET" "$ref"
+  pause
+}
+
+# alt-s: install dependencies (and migrate) in a slot.
+cmd_menu_setup() {
+  local dir="$1" kind="$2" slot
+  [ "$kind" = slot ] || { echo "Setup runs in numbered slots only."; pause; return 0; }
+  slot="$(slot_label "$dir" "$(repo_of "$dir")")"
+  (cd "$dir" && "$SELF" setup "$slot") || true
+  pause
+}
+
+# ctrl-x: remove an extra worktree. Slots and the main checkout stay put.
+cmd_remove() {
+  local dir="$1" kind="$2" ref root names parent answer
+  [ "$kind" = extra ] || { echo "Only extras can be removed. To clear a slot, free it with ctrl-f."; pause; return 0; }
+  while IFS=$'\t' read -r root names; do
+    [ "$root" = "$dir" ] && { echo "Still running here: $names. Stop it first."; pause; return 0; }
+  done < <(running_programs)
+  ref="$(wt_ref "$dir")"
+  printf 'Remove %s? Branch %s is kept. [y/N] ' "$dir" "$ref"
+  { read -r answer </dev/tty; } 2>/dev/null || read -r answer || answer=
+  [ "$answer" = y ] || [ "$answer" = Y ] || return 0
+  # Without --force git refuses if anything is uncommitted, which is the point.
+  git -C "$(repo_of "$dir")" worktree remove "$dir" || { pause; return 0; }
+  parent="$(dirname "$dir")"
+  rmdir "$parent" 2>/dev/null && echo "Removed empty folder $parent"
+  printf '%sRemoved.%s\n' "$GREEN" "$RESET"
+  pause
+}
+
+cmd_menu() {
+  command -v fzf >/dev/null 2>&1 || die "the menu needs fzf"
+  local s; s="$(printf '%q' "$SELF")"
+  "$SELF" _rows | fzf --ansi --reverse --no-sort --track --id-nth=1 --delimiter=$'\t' --with-nth=3.. \
+    --prompt='wtm> ' \
+    --header=$'enter open   ^b branch   ^f free   M-s setup   ^x remove   ^r refresh\n'"$(printf '%-20s %-10s %-44s %s' REPO SLOT BRANCH STATE)" \
+    --header-first \
+    --preview="$s _preview {1} {2}" --preview-window='down,55%,wrap' \
+    --bind="enter:become($s _open {1} {2})" \
+    --bind="ctrl-b:execute($s _branch {1} {2})+reload($s _rows)" \
+    --bind="ctrl-f:execute($s _free {1} {2})+reload($s _rows)" \
+    --bind="alt-s:execute($s _setup {1} {2})+reload($s _rows)" \
+    --bind="ctrl-x:execute($s _remove {1} {2})+reload($s _rows)" \
+    --bind="ctrl-r:reload($s _rows)" || true
+}
+
 case "${1:-}" in
+  '')     if [ -t 0 ] && [ -t 1 ]; then cmd_menu; else cmd_status; fi ;;
+  _rows)    shift; cmd_rows ;;
+  _preview) shift; cmd_preview "$@" ;;
+  _open)    shift; cmd_open "$@" ;;
+  _branch)  shift; cmd_branch "$@" ;;
+  _free)    shift; cmd_free "$@" ;;
+  _setup)   shift; cmd_menu_setup "$@" ;;
+  _remove)  shift; cmd_remove "$@" ;;
   init)   shift; cmd_init "$@" ;;
   list)   shift; cmd_list "$@" ;;
   status) shift; cmd_status "$@" ;;
   setup) shift; cmd_setup "$@" ;;
   clean) shift; cmd_clean "$@" ;;
-  ''|-h|--help|help)
+  -h|--help|help)
     awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
     ;;
   *) die "unknown command '$1' — try: wtm --help" ;;
